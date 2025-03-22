@@ -10,6 +10,7 @@ import torch
 from std_msgs.msg import Int32
 from ultralytics import YOLO
 from geometry_msgs.msg import Vector3
+from geometry_msgs.msg import Twist
 model = YOLO("/home/jonut/dentist/src/robot/train2/weights/best.pt")
 
 class RegionDetector(Node):
@@ -25,14 +26,20 @@ class RegionDetector(Node):
         self.timer = self.create_timer(0.05, self.cnt_vel_pub.publish)
         self.last_axis = Vector3()  # Store last Axis value   
 
+        self.cnt_arm = self.create_publisher(Twist, 'cnt_arm', 10)
+
         self.camera_switch_publisher = self.create_publisher(Int32, 'camera_switch', 10)  # Use Int32 here
         self.image_publisher = self.create_publisher(Image, 'processed_image', 10)
         self.black_state = True
         self.color_state = False
         self.turnaround_state = False
         self.pick_state = False
+        self.return_state_color = False
+        self.return_state_black = False
+        self.box_state = False
         self.current_state = " "
         self.receive_video() 
+        
 
     def filter_noise(self, contours, min_area=500):
         filtered_contours = []
@@ -130,7 +137,7 @@ class RegionDetector(Node):
             'bounding_boxes': []
         }
         height, width, _ = frame.shape
-        section_height = height // 8
+
 
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
@@ -144,8 +151,8 @@ class RegionDetector(Node):
         red_mask = cv2.bitwise_or(red_mask_1, red_mask_2)
 
         for i in range(8):
-            y_start = i * section_height
-            y_end = (i + 1) * section_height if i < 7 else height
+            y_start = i * (height // 8)
+            y_end = (i + 1) * (height // 8) if i < 7 else height
             red_mask_section = red_mask[y_start:y_end, :]
 
             contours, _ = cv2.findContours(red_mask_section, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -201,57 +208,7 @@ class RegionDetector(Node):
                     black_data['bounding_boxes'].append((x, y_start + y, w, h))
                     cv2.circle(frame, (cx, cy), 5, (255, 0, 0), -1)
 
-        return frame, black_data
-    
-    def detect_objects(self, frame):
-        results = model(frame)
-        processed_frame = frame.copy()
-
-        # คำนวณตำแหน่งของ crosshair (จุดกึ่งกลางภาพ)
-        h, w, _ = processed_frame.shape
-        center_x, center_y = w // 2, h // 2
-
-        # วาด crosshair
-        cv2.line(processed_frame, (center_x - 20, center_y), (center_x + 20, center_y), (255, 0, 0), 2)  # เส้นแนวนอน
-        cv2.line(processed_frame, (center_x, center_y - 20), (center_x, center_y + 20), (255, 0, 0), 2)  # เส้นแนวตั้ง
-
-        # วาด Bounding Box และ Centroid
-        for result in results:
-            for box in result.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                conf = box.conf[0].item()
-                cls = int(box.cls[0].item())
-                label = f"{model.names[cls]} {conf:.2f}"
-
-                # คำนวณ Centroid
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-
-                # คำนวณค่าความคลาดเคลื่อน (error) ในแกน X
-                error_x = center_x - cx  # ค่าความต่างระหว่าง crosshair และ centroid
-
-                # กำหนดค่า Axis ตามเงื่อนไขที่กำหนด
-                if abs(error_x) <= 10:
-                    axis = 0  # อยู่ในช่วง error ±10
-                elif center_x > cx:
-                    axis = -1  # crosshair อยู่ทางขวาของ centroid
-                else:
-                    axis = 1  # crosshair อยู่ทางซ้ายของ centroid
-
-                axis_label = f"Axis: {axis}"
-
-                # วาดกรอบสี่เหลี่ยมและ Centroid
-                cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(processed_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                cv2.circle(processed_frame, (cx, cy), 5, (0, 0, 255), -1)  # จุดสีแดง (Centroid)
-                cv2.putText(processed_frame, f"({cx},{cy})", (cx + 5, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-                # วาดเส้นจาก Centroid ไปยัง Crosshair
-                cv2.line(processed_frame, (cx, cy), (center_x, center_y), (0, 255, 255), 2)
-
-                # แสดงค่าของ Axis
-                cv2.putText(processed_frame, axis_label, (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-
-        return processed_frame , axis
+        return frame, black_data   
     
     def state(self, black_data, color_data, frame):
         self.current_state = "black_state"
@@ -262,7 +219,11 @@ class RegionDetector(Node):
         color_centroid = color_data['centroids']
         color_areas = color_data['areas']
         color_bounding_boxes = color_data['bounding_boxes']
+        
         switch_msg = Int32()
+        switch_msg.data = 0  # Set camera ID to 1
+        self.camera_switch_publisher.publish(switch_msg)
+
         height, width, _ = frame.shape
         Axis = [0, 0, 0]
         total_area = 0
@@ -271,70 +232,173 @@ class RegionDetector(Node):
         center_x_max = (width // 2) + middle_width
         cv2.line(frame, (center_x_min, 0), (center_x_min, height), (0, 255, 255), 2)  # เส้นซ้าย
         cv2.line(frame, (center_x_max, 0), (center_x_max, height), (0, 255, 255), 2)  # เส้นขวา
-
+        n = 0.4
+        m = 0.8
+        o = 0.3
+        p = 0.8
         section_height = height // 8
-        lower_region_start = height - (3 * section_height)
-        red_in_lower_region = any(cy >= lower_region_start for _, cy in color_centroid)
-        
-        if self.black_state:
-            if not black_centroid :
-                        Axis[2] = 1  
-                        return Axis, frame
+        lower_region_start = height - (section_height)
+        color_in_lower_region = any(cy >= lower_region_start for _, cy in color_centroid)
 
-            if len(black_centroid) >= 3:
-                if red_in_lower_region:
-                    self.current_state = "color_state"
-                    self.color_state = True
-                    self.black_state = False   
-                else:
-                    centroids_sorted = sorted(black_centroid, key=lambda c: c[1], reverse=True)
-                    closest_centroids = centroids_sorted[:3]
-                    total_area = sum([black_areas[i] for i in range(3)])
+        if self.black_state:
+            if not black_centroid:
+                Axis[2] = 1 * m
+                self.last_axis = Vector3(x=float(Axis[0]), y=float(Axis[1]), z=float(Axis[2]))
+                self.cnt_vel_pub.publish(self.last_axis)
+                cv2.putText(frame, f"z = {Axis[2]}", (5, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(frame, f"state = {self.current_state}", (5, 210), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                return Axis, frame
+
+            elif black_centroid is not None and len(black_centroid) < 3:
+                centroids_sorted = sorted(black_centroid, key=lambda c: c[1], reverse=True)
+                closest_centroids = centroids_sorted[:min(len(centroids_sorted), 3)]  # ป้องกันกรณีมีจุด < 3
+
+                if closest_centroids:  # ตรวจสอบว่ามีข้อมูลก่อนคำนวณ
                     avg_x = np.mean([c[0] for c in closest_centroids])
 
-                    if total_area > 24000:
-                        Axis[0] = 0
-                    elif abs(avg_x - width // 2) <= middle_width:
-                        Axis[0] = 1
-                    elif avg_x < width // 2:
-                        Axis[2] = -1
+                    if avg_x < width // 2:
+                        Axis[2] = -1 * m
                     else:
-                        Axis[2] = 1
+                        Axis[2] = 1 * m
+            elif len(black_centroid) >= 3:
+                    centroids_sorted = sorted(black_centroid, key=lambda c: c[1], reverse=True)
+                    closest_centroids = centroids_sorted[:3]
+                    total_area = sum([black_areas[black_centroid.index(c)] for c in closest_centroids])
+                    avg_x = np.mean([c[0] for c in closest_centroids])
+                    closest_bounding_boxes = [black_bounding_boxes[black_centroid.index(c)] for c in closest_centroids]
 
-                    for i, centroid in enumerate(closest_centroids):
+
+                    if abs(avg_x - width // 2) <= middle_width:
+                        Axis[0] = 1*n
+                    elif avg_x < width // 2:
+                        Axis[2] = -1*m
+                    else:
+                        Axis[2] = 1*m
+
+                    if color_in_lower_region:
+                        self.black_state = False
+                        self.color_state = True
+
+                    for centroid, bbox in zip(closest_centroids, closest_bounding_boxes):
                         cx, cy = centroid
-                        x, y, w, h = black_bounding_boxes[i]
-                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        x, y, w, h = bbox
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 255), 2)
+
 
         elif self.color_state:
-            if not color_centroid :
-                        Axis[2] = 1  
+            self.current_state = "color_state"
+            if not color_centroid or len(color_centroid) < 3:
+                        Axis[2] = -1*m
+                        self.last_axis = Vector3(x=float(Axis[0]), y=float(Axis[1]), z=float(Axis[2]))
+                        self.cnt_vel_pub.publish(self.last_axis)
+                        cv2.putText(frame, f"z = {Axis[2]}", (5, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                        cv2.putText(frame, f"state = {self.current_state}", (5, 210), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
                         return Axis, frame
-            if len(color_centroid) >= 3:
+            elif len(color_centroid) >= 3:
                 centroids_sorted = sorted(color_centroid, key=lambda c: c[1], reverse=True)
                 closest_centroids = centroids_sorted[:3]
-                total_area = sum([color_areas[i] for i in range(3)])
+                total_area = sum([color_areas[color_centroid.index(c)] for c in closest_centroids])
                 avg_x = np.mean([c[0] for c in closest_centroids])
+                closest_bounding_boxes = [color_bounding_boxes[color_centroid.index(c)] for c in closest_centroids]
+                if total_area > 32000:
+                        Axis[0] = 0
+                        switch_msg.data = 1  # Set camera ID to 1
+                        self.camera_switch_publisher.publish(switch_msg)
+                        self.color_state = False
+                        self.pick_state = True
 
-                if total_area > 24000:
-                    self.current_state = "pick_state"
-                    switch_msg.data = 1  # Set camera ID to 1
-                    self.camera_switch_publisher.publish(switch_msg)
-                    self.wait_for_publish_success()
-                    self.pick_state = True
-                    self.color_state = False
                 elif abs(avg_x - width // 2) <= middle_width:
-                    Axis[0] = 1
+                    Axis[0] = 1*o
                 elif avg_x < width // 2:
-                    Axis[2] = -1
+                    Axis[2] = -1*p
                 else:
-                    Axis[2] = 1
+                    Axis[2] = 1*p
 
-                for i, centroid in enumerate(closest_centroids):
+                for centroid, bbox in zip(closest_centroids, closest_bounding_boxes):
                     cx, cy = centroid
-                    x, y, w, h = color_bounding_boxes[i]
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 255), 2)  # วาดกรอบสีขาว
-        
+                    x, y, w, h = bbox
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 255), 2)
+
+        elif self.return_state_color:
+                    self.current_state = "return_state_color"
+                    if not color_centroid :
+                            Axis[2] = 1*m
+                            self.last_axis = Vector3(x=float(Axis[0]), y=float(Axis[1]), z=float(Axis[2]))
+                            self.cnt_vel_pub.publish(self.last_axis)
+                            cv2.putText(frame, f"z = {Axis[2]}", (5, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                            cv2.putText(frame, f"state = {self.current_state}", (5, 210), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                            if  black_centroid:
+                                Axis[2] = 1*m
+                                self.return_state_color = False
+                                self.return_state_black = True
+                            return Axis, frame
+                    elif len(color_centroid) >= 3:
+                            centroids_sorted = sorted(color_centroid, key=lambda c: c[1], reverse=True)
+                            closest_centroids = centroids_sorted[:3]
+                            total_area = sum([color_areas[i] for i in range(3)])
+                            avg_x = np.mean([c[0] for c in closest_centroids])
+                                    
+                            if abs(avg_x - width // 2) <= middle_width:
+                                Axis[0] = 1*n
+                            elif avg_x < width // 2:
+                                Axis[2] = -1*m
+                            else:
+                                Axis[2] = 1*m
+
+        elif self.return_state_black:
+                    self.current_state = "return_state_black"
+                    if not black_centroid:
+                        Axis[2] = 1 * m
+                        self.last_axis = Vector3(x=float(Axis[0]), y=float(Axis[1]), z=float(Axis[2]))
+                        self.cnt_vel_pub.publish(self.last_axis)
+                        cv2.putText(frame, f"z = {Axis[2]}", (5, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                        cv2.putText(frame, f"state = {self.current_state}", (5, 210), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+                        return Axis, frame
+
+                    elif black_centroid is not None and len(black_centroid) < 3:
+                        centroids_sorted = sorted(black_centroid, key=lambda c: c[1], reverse=True)
+                        closest_centroids = centroids_sorted[:min(len(centroids_sorted), 3)]  # ป้องกันกรณีมีจุด < 3
+
+                        if closest_centroids:  # ตรวจสอบว่ามีข้อมูลก่อนคำนวณ
+                            avg_x = np.mean([c[0] for c in closest_centroids])
+
+                            if avg_x < width // 2:
+                                Axis[2] = -1 * m
+                            else:
+                                Axis[2] = 1 * m
+                                
+                    elif len(black_centroid) >= 3:
+                            centroids_sorted = sorted(black_centroid, key=lambda c: c[1], reverse=True)
+                            closest_centroids = centroids_sorted[:3]
+                            total_area = sum([black_areas[black_centroid.index(c)] for c in closest_centroids])
+                            avg_x = np.mean([c[0] for c in closest_centroids])
+                            closest_bounding_boxes = [black_bounding_boxes[black_centroid.index(c)] for c in closest_centroids]
+
+
+                            if abs(avg_x - width // 2) <= middle_width:
+                                Axis[0] = 1*n
+                            elif total_area > 25000:
+                                self.return_state_black
+                                self.box_state = True
+                            elif avg_x < width // 2:
+                                Axis[2] = -1*m
+                            else:
+                                Axis[2] = 1*m
+
+                            for centroid, bbox in zip(closest_centroids, closest_bounding_boxes):
+                                cx, cy = centroid
+                                x, y, w, h = bbox
+                                cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 255), 2)
+        elif self.box_state :
+            Axis[2] = 1*m
+            if not black_centroid :
+                Axis[2] = 0
+                self.box_state = False
+                self.drop_state = True
+
+        elif self.drop_state:
+            pass
+
         self.last_axis = Vector3(x=float(Axis[0]), y=float(Axis[1]), z=float(Axis[2]))
         self.cnt_vel_pub.publish(self.last_axis)
         cv2.putText(frame, f"x = {Axis[0]}", (5, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
@@ -348,58 +412,90 @@ class RegionDetector(Node):
         
         return Axis, frame
     
-    def detect_objects(self, state ,frame):
-        results = model(frame)
-        processed_frame = frame.copy()
-
-        # คำนวณตำแหน่งของ crosshair (จุดกึ่งกลางภาพ)
-        h, w, _ = processed_frame.shape
-        center_x, center_y = w // 2, h // 2
-
-        # วาด crosshair
-        cv2.line(processed_frame, (center_x - 20, center_y), (center_x + 20, center_y), (255, 0, 0), 2)  # เส้นแนวนอน
-        cv2.line(processed_frame, (center_x, center_y - 20), (center_x, center_y + 20), (255, 0, 0), 2)  # เส้นแนวตั้ง
-
-        # วาด Bounding Box และ Centroid
-        for result in results:
-            for box in result.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                conf = box.conf[0].item()
-                cls = int(box.cls[0].item())
-                label = f"{model.names[cls]} {conf:.2f}"
-
-                # คำนวณ Centroid
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-
-                # คำนวณค่าความคลาดเคลื่อน (error) ในแกน X
-                error_x = center_x - cx  # ค่าความต่างระหว่าง crosshair และ centroid
-
-                # กำหนดค่า Axis ตามเงื่อนไขที่กำหนด
-                if abs(error_x) <= 10:
-                    axis = 0  # อยู่ในช่วง error ±10
-                elif center_x > cx:
-                    axis = -1  # crosshair อยู่ทางขวาของ centroid
-                else:
-                    axis = 1  # crosshair อยู่ทางซ้ายของ centroid
-
-                axis_label = f"Axis: {axis}"
-
-                # วาดกรอบสี่เหลี่ยมและ Centroid
-                cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(processed_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                cv2.circle(processed_frame, (cx, cy), 5, (0, 0, 255), -1)  # จุดสีแดง (Centroid)
-                cv2.putText(processed_frame, f"({cx},{cy})", (cx + 5, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-                # วาดเส้นจาก Centroid ไปยัง Crosshair
-                cv2.line(processed_frame, (cx, cy), (center_x, center_y), (0, 255, 255), 2)
-
-                # แสดงค่าของ Axis
-                cv2.putText(processed_frame, axis_label, (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-
-        return processed_frame
-
+    
     def wait_for_publish_success(self):
         rclpy.spin_once(self, timeout_sec=2.0)
+    
+    def detect_objects(self, state, frame):
+        Axis_wheel = [0, 0, 0]
+        Axis_arm = [0.0, 0.0, 0.0, 0.0, 0.0]  # ถ้าไม่ใช้สามารถลบได้
+        results = model(frame)
+        processed_frame = frame.copy()
+        
+        # ค่าพื้นฐาน
+        base_size = 380 * 380
+        size_threshold = base_size * 1.5
+        min_confidence = 0.70  # กำหนดค่าความมั่นใจขั้นต่ำ
+        # ตำแหน่งกึ่งกลางภาพ
+        h, w, _ = processed_frame.shape
+        center_x, center_y = w // 2, h // 2
+        
+        # วาด crosshair
+        cv2.line(processed_frame, (center_x - 20, center_y), (center_x + 20, center_y), (255, 0, 0), 2)
+        cv2.line(processed_frame, (center_x, center_y - 20), (center_x, center_y + 20), (255, 0, 0), 2)
+
+        for result in results:
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                conf = float(box.conf[0].item())
+                cls = int(box.cls[0].item())
+                
+                if conf < min_confidence:
+                    continue  # ข้ามวัตถุที่มีค่าความมั่นใจต่ำ
+                
+                label = f"{model.names[cls]} {conf:.2f}"
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                error_x = cx - center_x
+                
+                obj_width = x2 - x1
+                obj_height = y2 - y1
+                obj_size = obj_width * obj_height
+                
+                # กำหนดค่า Axis_wheel[0] ตามขนาดของวัตถุ
+                if obj_size < base_size:
+                    Axis_wheel[0] = 1*0.5  # วัตถุมีขนาดเล็ก
+                elif obj_size > size_threshold:
+                    Axis_wheel[0] = -1*0.5  # วัตถุมีขนาดใหญ่เกินไป
+                else:
+                    Axis_wheel[0] = 0  # ขนาดปกติ
+                
+                # กำหนดค่า Axis_wheel[1] ตามตำแหน่งแนวแกน x
+                if abs(error_x) <= 50:
+                    Axis_wheel[1] = 0
+                elif cx < center_x:
+                    Axis_wheel[1] = -1*0.4
+                else:
+                    Axis_wheel[1] = 1*0.4
+
+                if Axis_wheel[0] == 0 and Axis_wheel[1] == 0:
+                    Axis_arm = [0.0, 0.0, 0.0, 0.0, 1.0]
+                    Axis_arm_msg = Twist()  # สร้าง Twist message
+                    Axis_arm_msg.linear.x = Axis_arm[0]  # เปลี่ยนจาก self.Axis_arm เป็น Axis_arm
+                    Axis_arm_msg.linear.y = Axis_arm[1]
+                    Axis_arm_msg.linear.z = Axis_arm[2]
+                    Axis_arm_msg.angular.x = Axis_arm[3]
+                    Axis_arm_msg.angular.y = Axis_arm[4]
+                    Axis_arm_msg.angular.z = 0.0
+                    self.cnt_arm.publish(Axis_arm_msg)
+                    self.return_state_color = True
+                    self.pick_state = False
+
+                axis_y = f"AxisY: {Axis_wheel[1]}"
+                axis_x = f"AxisX: {Axis_wheel[0]}"
+                
+                # วาดกราฟิก
+                cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(processed_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.circle(processed_frame, (cx, cy), 5, (0, 0, 255), -1)
+                cv2.putText(processed_frame, f"({cx},{cy})", (cx + 5, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                cv2.line(processed_frame, (cx, cy), (center_x, center_y), (0, 255, 255), 2)
+                cv2.putText(processed_frame, axis_y, (x1, y1 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                cv2.putText(processed_frame, axis_x, (x1, y1 - 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+        self.last_axis = Vector3(x=float(Axis_wheel[0]), y=float(Axis_wheel[1]), z=float(Axis_wheel[2]))
+        self.cnt_vel_pub.publish(self.last_axis)
+        return processed_frame, Axis_wheel, Axis_arm
+
 
     def receive_video(self):
         while rclpy.ok():
@@ -430,14 +526,16 @@ class RegionDetector(Node):
                     frame = cv2.imdecode(np.frombuffer(frame_data, dtype=np.uint8), cv2.IMREAD_COLOR)
 
                     if self.pick_state:
-                        processed_frame = self.detect_objects(self.state, frame)
+                        processed_frame, Axis_wheel, Axis_arm = self.detect_objects(self.current_state, frame)
                     else:
+                        if self.return_state_color :
+                            self.black_state = False
                         processed_frame, blue_data = self.detect_blue_regions(frame)
                         processed_frame, green_data = self.detect_green_regions(processed_frame)
                         processed_frame, red_data = self.detect_red_regions(processed_frame)
                         processed_frame, black_data = self.detect_black_regions(processed_frame)
                         Axis = self.state(black_data, red_data, processed_frame)
-
+                    
                     ros_image = self.bridge.cv2_to_imgmsg(processed_frame, encoding='bgr8')
                     self.image_publisher.publish(ros_image)
 
